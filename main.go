@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -495,12 +496,44 @@ func main() {
 	})
 
 	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, req *http.Request) {
-		chirps, err := apiCfg.db.GetAllChirps(req.Context())
-		if err != nil {
-			fmt.Printf("error - failed to retrieve chirps: %s", err)
-			w.WriteHeader(400)
-			return
+		authorIDStr := req.URL.Query().Get("author_id")
+
+		var chirps []database.Chirp
+
+		if authorIDStr != "" {
+			authorID, err := uuid.Parse(authorIDStr)
+			if err != nil {
+				w.WriteHeader(400)
+				return
+			}
+
+			chirps, err = apiCfg.db.GetChirpsByUser(req.Context(), authorID)
+			if err != nil {
+				fmt.Printf("error - failed to retrieve chirps: %s", err)
+				w.WriteHeader(400)
+				return
+			}
+		} else {
+			chirps, err = apiCfg.db.GetAllChirps(req.Context())
+			if err != nil {
+				fmt.Printf("error - failed to retrieve chirps: %s", err)
+				w.WriteHeader(400)
+				return
+			}
 		}
+
+		sortDirection := "asc"
+		sortDirectionParam := req.URL.Query().Get("sort")
+		if sortDirectionParam == "desc" {
+			sortDirection = "desc"
+		}
+
+		sort.Slice(chirps, func(i, j int) bool {
+			if sortDirection == "desc" {
+				return chirps[i].CreatedAt.After(chirps[j].CreatedAt)
+			}
+			return chirps[i].CreatedAt.Before(chirps[j].CreatedAt)
+		})
 
 		w.Header().Set("Content-type", "application/json")
 		dat, err := json.Marshal(chirps)
