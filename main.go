@@ -24,6 +24,7 @@ type apiConfig struct {
 	db             *database.Queries
 	platform       string
 	jwt_secret     string
+	polka_key      string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -56,6 +57,7 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
 	jwt_secret := os.Getenv("JWT_SECRET")
+	polka_key := os.Getenv("POLKA_KEY")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		fmt.Printf("Error loading database")
@@ -74,6 +76,7 @@ func main() {
 		db:         dbQueries,
 		platform:   platform,
 		jwt_secret: jwt_secret,
+		polka_key:  polka_key,
 	}
 
 	type User struct {
@@ -145,11 +148,12 @@ func main() {
 			return
 		}
 
-		user := User{
-			ID:        user_sql.ID,
-			CreatedAt: user_sql.CreatedAt,
-			UpdatedAt: user_sql.UpdatedAt,
-			Email:     user_sql.Email,
+		user := database.User{
+			ID:          user_sql.ID,
+			CreatedAt:   user_sql.CreatedAt,
+			UpdatedAt:   user_sql.UpdatedAt,
+			Email:       user_sql.Email,
+			IsChirpyRed: user_sql.IsChirpyRed,
 		}
 
 		w.Header().Set("Content-type", "application/json")
@@ -170,6 +174,7 @@ func main() {
 			CreatedAt    time.Time `json:"created_at"`
 			UpdatedAt    time.Time `json:"updated_at"`
 			Email        string    `json:"email"`
+			IsChirpyRed  bool      `json:"is_chirpy_red"`
 			Token        string    `json:"token"`
 			RefreshToken string    `json:"refresh_token"`
 		}
@@ -227,6 +232,7 @@ func main() {
 			CreatedAt:    user.CreatedAt,
 			UpdatedAt:    user.UpdatedAt,
 			Email:        user.Email,
+			IsChirpyRed:  user.IsChirpyRed,
 			Token:        accessToken,
 			RefreshToken: refresh_token,
 		}
@@ -293,6 +299,116 @@ func main() {
 
 		w.WriteHeader(200)
 		w.Write(dat)
+	})
+
+	mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Password string `json:"password"`
+			Email    string `json:"email"`
+		}
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			w.WriteHeader(401)
+			return
+		}
+
+		auth_slice := strings.Split(authHeader, " ")
+		if auth_slice[0] != "Bearer" || len(auth_slice) < 2 {
+			w.WriteHeader(401)
+			return
+		}
+
+		access_token := auth_slice[1]
+		user_id, err := auth.ValidateJWT(access_token, apiCfg.jwt_secret)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		err = decoder.Decode(&params)
+		if err != nil {
+			fmt.Printf("Error decoding params: %s", err)
+			w.WriteHeader(400)
+			return
+		}
+
+		hashed_password, err := auth.HashPassword(params.Password)
+		if err != nil {
+			fmt.Printf("Error hashing password: %s", err)
+			w.WriteHeader(400)
+			return
+		}
+
+		update_user_params := database.UpdateUserParams{
+			Email:          params.Email,
+			HashedPassword: hashed_password,
+			ID:             user_id,
+		}
+
+		updated_user, err := apiCfg.db.UpdateUser(r.Context(), update_user_params)
+		if err != nil {
+			fmt.Printf("Error updating user: %s", err)
+			w.WriteHeader(400)
+			return
+		}
+
+		data, err := json.Marshal(updated_user)
+		if err != nil {
+			fmt.Printf("Error marshalling data: %s", err)
+			w.WriteHeader(400)
+			return
+		}
+
+		w.WriteHeader(200)
+		w.Write(data)
+	})
+
+	mux.HandleFunc("DELETE /api/chirps/{chirpId}", func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			w.WriteHeader(401)
+			return
+		}
+
+		auth_slice := strings.Split(authHeader, " ")
+		if auth_slice[0] != "Bearer" || len(auth_slice) < 2 {
+			w.WriteHeader(401)
+			return
+		}
+
+		access_token := auth_slice[1]
+		user_id, err := auth.ValidateJWT(access_token, apiCfg.jwt_secret)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+
+		chirpId, err := uuid.Parse(r.PathValue("chirpId"))
+		if err != nil {
+			w.WriteHeader(400)
+			return
+		}
+		chirp, err := apiCfg.db.GetChirp(r.Context(), chirpId)
+		if err != nil {
+			w.WriteHeader(404)
+			return
+		}
+
+		if chirp.UserID != user_id {
+			w.WriteHeader(403)
+			return
+		}
+
+		err = apiCfg.db.DeleteChirp(r.Context(), chirp.ID)
+		if err != nil {
+			w.WriteHeader(500)
+			return
+		}
+
+		w.WriteHeader(204)
 	})
 
 	mux.HandleFunc("POST /api/revoke", func(w http.ResponseWriter, r *http.Request) {
@@ -404,7 +520,7 @@ func main() {
 		}
 		chirp, err := apiCfg.db.GetChirp(r.Context(), chirpId)
 		if err != nil {
-			w.WriteHeader(400)
+			w.WriteHeader(404)
 			return
 		}
 
@@ -416,6 +532,53 @@ func main() {
 		}
 		w.WriteHeader(200)
 		w.Write(dat)
+	})
+
+	mux.HandleFunc("POST /api/polka/webhooks", func(w http.ResponseWriter, r *http.Request) {
+		type Data struct {
+			UserId string `json:"user_id"`
+		}
+
+		type RequestParams struct {
+			Event string `json:"event"`
+			Data  Data   `json:"data"`
+		}
+
+		api_key, err := auth.GetAPIKey(r.Header)
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+
+		if api_key != apiCfg.polka_key {
+			w.WriteHeader(401)
+			return
+		}
+
+		request := RequestParams{}
+		err = json.NewDecoder(r.Body).Decode(&request)
+		if err != nil {
+			w.WriteHeader(400)
+			return
+		}
+
+		if request.Event != "user.upgraded" {
+			w.WriteHeader(204)
+			return
+		}
+
+		user_id, err := uuid.Parse(request.Data.UserId)
+		if err != nil {
+			w.WriteHeader(400)
+			return
+		}
+
+		err = apiCfg.db.UpdateChirpyRed(r.Context(), user_id)
+		if err != nil {
+			w.WriteHeader(404)
+		}
+
+		w.WriteHeader(204)
 	})
 
 	log.Printf("Serving on port: %s\n", port)
