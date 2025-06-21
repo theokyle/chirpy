@@ -162,16 +162,16 @@ func main() {
 	})
 	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Password         string `json:"password"`
-			Email            string `json:"email"`
-			ExpiresInSeconds int    `json:"expires_in_seconds"`
+			Password string `json:"password"`
+			Email    string `json:"email"`
 		}
 		type response struct {
-			ID        uuid.UUID `json:"id"`
-			CreatedAt time.Time `json:"created_at"`
-			UpdatedAt time.Time `json:"updated_at"`
-			Email     string    `json:"email"`
-			Token     string    `json:"token"`
+			ID           uuid.UUID `json:"id"`
+			CreatedAt    time.Time `json:"created_at"`
+			UpdatedAt    time.Time `json:"updated_at"`
+			Email        string    `json:"email"`
+			Token        string    `json:"token"`
+			RefreshToken string    `json:"refresh_token"`
 		}
 
 		decoder := json.NewDecoder(r.Body)
@@ -198,9 +198,6 @@ func main() {
 		}
 
 		expirationTime := time.Hour
-		if params.ExpiresInSeconds > 0 && params.ExpiresInSeconds < 3600 {
-			expirationTime = time.Duration(params.ExpiresInSeconds) * time.Second
-		}
 
 		accessToken, err := auth.MakeJWT(
 			user.ID,
@@ -212,12 +209,26 @@ func main() {
 			return
 		}
 
+		refresh_token, _ := auth.MakeRefreshToken()
+		create_refresh_token_params := database.CreateRefreshTokenParams{
+			Token:     refresh_token,
+			UserID:    user.ID,
+			ExpiresAt: time.Now().Add(1440 * time.Hour),
+		}
+		_, err = apiCfg.db.CreateRefreshToken(r.Context(), create_refresh_token_params)
+		if err != nil {
+			w.WriteHeader(400)
+			w.Write([]byte("unable to generate refresh token"))
+			return
+		}
+
 		user_resp := response{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
-			Token:     accessToken,
+			ID:           user.ID,
+			CreatedAt:    user.CreatedAt,
+			UpdatedAt:    user.UpdatedAt,
+			Email:        user.Email,
+			Token:        accessToken,
+			RefreshToken: refresh_token,
 		}
 
 		dat, err := json.Marshal(user_resp)
@@ -229,6 +240,83 @@ func main() {
 		w.WriteHeader(200)
 		w.Write(dat)
 	})
+
+	mux.HandleFunc("POST /api/refresh", func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			w.WriteHeader(401)
+			return
+		}
+
+		auth_slice := strings.Split(authHeader, " ")
+		if auth_slice[0] != "Bearer" || len(auth_slice) < 2 {
+			w.WriteHeader(401)
+			return
+		}
+
+		refresh_token, err := apiCfg.db.GetUserFromRefreshToken(r.Context(), auth_slice[1])
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+
+		if time.Now().After(refresh_token.ExpiresAt) || refresh_token.RevokedAt.Valid {
+			w.WriteHeader(401)
+			return
+		}
+
+		expirationTime := time.Hour
+
+		accessToken, err := auth.MakeJWT(
+			refresh_token.UserID,
+			apiCfg.jwt_secret,
+			expirationTime,
+		)
+		if err != nil {
+			w.WriteHeader(400)
+			return
+		}
+
+		type response struct {
+			Token string `json:"token"`
+		}
+
+		resp := response{
+			Token: accessToken,
+		}
+
+		dat, err := json.Marshal(resp)
+		if err != nil {
+			w.WriteHeader(400)
+			return
+		}
+
+		w.WriteHeader(200)
+		w.Write(dat)
+	})
+
+	mux.HandleFunc("POST /api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			w.WriteHeader(401)
+			return
+		}
+
+		auth_slice := strings.Split(authHeader, " ")
+		if auth_slice[0] != "Bearer" || len(auth_slice) < 2 {
+			w.WriteHeader(401)
+			return
+		}
+
+		err := apiCfg.db.RevokeToken(r.Context(), auth_slice[1])
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+
+		w.WriteHeader(204)
+	})
+
 	mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, req *http.Request) {
 		type parameters struct {
 			Body string `json:"body"`
